@@ -1,16 +1,28 @@
-from fastapi import FastAPI, HTTPException, Depends
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, Depends, Response, Request
+from sqlalchemy import column, func
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 import models
 import schemas
 from typing import List, Annotated
 import auth
+from models import Member, Review, Book, BorrowRecord
 from starlette import status
+from starlette.middleware.base import BaseHTTPMiddleware
+from middleware import log_requests
+# from middleware import router as log_requests_router
 
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
+# Middleware for logging all requests
+app.add_middleware(BaseHTTPMiddleware, dispatch=log_requests)
+
 app.include_router(auth.router)
+# app.include_router(log_requests_router)
 
 
 # Dependency to get the database session
@@ -25,8 +37,9 @@ def get_db():
 db_dependency = Annotated[Session, Depends(get_db)]
 user_dependency = Annotated[Session, Depends(auth.get_current_user)]
 
-
 # user
+
+
 @app.get("/users", status_code=status.HTTP_200_OK)
 async def user(user: user_dependency, db: db_dependency):
     if user is None:
@@ -130,6 +143,68 @@ def list_members(user: user_dependency, skip: int = 0, limit: int = 10, db: Sess
     return members
 
 
+@app.post("/borrow/{book_id}/{member_id}", response_model=schemas.BorrowRecord)
+def borrow_book(user: user_dependency, book_id: int, member_id: int, db: Session = Depends(get_db)):
+    # Check if the book is already borrowed
+    existing_record = db.query(BorrowRecord).filter(
+        BorrowRecord.book_id == book_id, BorrowRecord.return_date.is_(None)
+    ).first()
+
+    if existing_record and existing_record.member_id != member_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This book is already borrowed by another member."
+        )
+
+    # Check if the member has already borrowed the same book
+    existing_record_same_book = db.query(BorrowRecord).filter(
+        BorrowRecord.member_id == member_id, BorrowRecord.book_id == book_id, BorrowRecord.return_date.is_(None)
+    ).first()
+
+    if existing_record_same_book:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You have already borrowed this book. Return it before borrowing it again."
+        )
+
+    borrow_record = BorrowRecord(
+        borrow_date=datetime.utcnow(),
+        book_id=book_id,
+        member_id=member_id
+    )
+
+    db.add(borrow_record)
+    db.commit()
+    db.refresh(borrow_record)
+
+    return borrow_record
+
+
+@app.post("/return/{book_id}/{member_id}", response_model=schemas.BorrowRecord)
+def return_book(user: user_dependency, book_id: int, member_id: int, db: Session = Depends(get_db)):
+    # Check if the book is borrowed by the specified member
+    borrow_record = db.query(BorrowRecord).filter(
+        BorrowRecord.book_id == book_id,
+        BorrowRecord.member_id == member_id,
+        BorrowRecord.return_date.is_(None)
+    ).first()
+
+    if not borrow_record:
+        raise ValueError("This book is not borrowed by the specified member.")
+
+    # Set the return date to the current timestamp
+    borrow_record.return_date = datetime.utcnow()
+
+    # Delete the BorrowRecord from the database
+    db.delete(borrow_record)
+
+    # Commit the changes to the database
+    db.commit()
+
+    # Return the updated BorrowRecord as the response
+    return borrow_record
+
+
 @app.get("/members/{member_id}/borrowed_books", response_model=List[schemas.BorrowRecord])
 def read_borrowed_books(user: user_dependency, member_id: int, db: Session = Depends(get_db)):
     member = db.query(models.Member).filter(models.Member.id == member_id).first()
@@ -148,29 +223,6 @@ def read_borrowing_members(user: user_dependency, book_id: int, db: Session = De
     return borrowing_members
 
 
-@app.post("/borrow-records/", response_model=schemas.BorrowRecord)
-def create_borrow_record(user: user_dependency, borrow_record: schemas.BorrowRecordCreate,
-                         db: Session = Depends(get_db)):
-    # Check if the book is available for borrowing
-    book = db.query(models.Book).filter(models.Book.id == borrow_record.book_id).first()
-    if book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
-
-    if any(record.return_date is None for record in book.borrow_records):
-        raise HTTPException(status_code=400, detail="Book is already borrowed")
-
-    # Check if the member exists
-    member = db.query(models.Member).filter(models.Member.id == borrow_record.member_id).first()
-    if member is None:
-        raise HTTPException(status_code=404, detail="Member not found")
-
-    db_borrow_record = models.BorrowRecord(**borrow_record.dict())
-    db.add(db_borrow_record)
-    db.commit()
-    db.refresh(db_borrow_record)
-    return db_borrow_record
-
-
 @app.get("/borrow-records/{record_id}", response_model=schemas.BorrowRecord)
 def read_borrow_record(user: user_dependency, record_id: int, db: Session = Depends(get_db)):
     borrow_record = db.query(models.BorrowRecord).filter(models.BorrowRecord.id == record_id).first()
@@ -180,8 +232,8 @@ def read_borrow_record(user: user_dependency, record_id: int, db: Session = Depe
 
 
 @app.get("/borrow-records/", response_model=list[schemas.BorrowRecord])
-def list_borrow_records(user: user_dependency, skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    borrow_records = db.query(models.BorrowRecord).offset(skip).limit(limit).all()
+def list_borrow_records(user: user_dependency, db: Session = Depends(get_db)):
+    borrow_records = db.query(models.BorrowRecord).all()
     return borrow_records
 
 
@@ -209,3 +261,87 @@ def delete_borrow_record(user: user_dependency, record_id: int, db: Session = De
     db.delete(borrow_record)
     db.commit()
     return borrow_record
+
+
+# CRUD operations for book reviews
+@app.post("/reviews/", response_model=schemas.Review)
+def create_review(user: user_dependency, review: schemas.ReviewCreate, db: Session = Depends(get_db)):
+    db_review = models.Review(**review.dict())
+    db.add(db_review)
+    db.commit()
+    db.refresh(db_review)
+    return db_review
+
+
+@app.get("/reviews/{review_id}", response_model=schemas.Review)
+def read_review(user: user_dependency, review_id: int, db: Session = Depends(get_db)):
+    review = db.query(models.Review).filter(models.Review.id == review_id).first()
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return review
+
+
+@app.get("/reviews/", response_model=List[schemas.Review])
+def list_reviews(user: user_dependency, skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    reviews = db.query(models.Review).offset(skip).limit(limit).all()
+    return reviews
+
+
+@app.put("/reviews/{review_id}", response_model=schemas.Review)
+def update_review(user: user_dependency, review_id: int, review: schemas.ReviewCreate, db: Session = Depends(get_db)):
+    db_review = db.query(models.Review).filter(models.Review.id == review_id).first()
+    if db_review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    for key, value in review.dict().items():
+        setattr(db_review, key, value)
+
+    db.commit()
+    db.refresh(db_review)
+    return db_review
+
+
+@app.delete("/reviews/{review_id}", response_model=schemas.Review)
+def delete_review(user: user_dependency, review_id: int, db: Session = Depends(get_db)):
+    review = db.query(models.Review).filter(models.Review.id == review_id).first()
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    db.delete(review)
+    db.commit()
+    return review
+
+
+# Endpoint for book recommendations
+@app.get("/recommend/{member_id}", response_model=List[schemas.Book])
+def recommend_books(user: user_dependency, member_id: int, db: Session = Depends(get_db)):
+    # Get the most frequently borrowed book type by the member
+    most_borrowed_type = db.query(Book.type_of_book).join(
+        BorrowRecord, BorrowRecord.book_id == Book.id
+    ).filter(
+        BorrowRecord.member_id == member_id, BorrowRecord.return_date.is_(None)
+    ).group_by(Book.type_of_book).order_by(func.count().desc()).first()
+
+    if not most_borrowed_type:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No borrowing history found for the member."
+        )
+
+    # Get books of the same type that the member has not already borrowed
+    recommended_books = db.query(Book).filter(
+        Book.type_of_book == most_borrowed_type[0],
+        ~Book.id.in_(
+            db.query(BorrowRecord.book_id).filter(
+                BorrowRecord.member_id == member_id, BorrowRecord.return_date.is_(None)
+            )
+        )
+    ).all()
+
+    if not recommended_books:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No recommended books found."
+        )
+
+    return recommended_books
